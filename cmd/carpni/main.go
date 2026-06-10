@@ -17,6 +17,7 @@ import (
 	"flag"
 	"io"
 	"log"
+	"net/http"
 	"net/url"
 	"os"
 	"os/signal"
@@ -130,16 +131,22 @@ func main() {
 	}
 	defer ds.Close()
 
-	// No WithHttpPublisherWithoutServer: the engine runs its own ad-chain HTTP
-	// server on WithHttpPublisherListenAddr, serving /ipni/v1/ad/... for the
-	// indexer to pull.
+	// The engine builds and signs the ad chain but does not serve it
+	// (WithoutServer); we mount its publisher handler on our own HTTP server
+	// below so the indexer can pull /ipni/v1/ad/... from --listen. (Letting the
+	// engine self-serve was tried and served 404 for every path.)
 	eng, err := engine.New(
 		engine.WithPrivateKey(privKey),
 		engine.WithDatastore(ds),
 		engine.WithProvider(peer.AddrInfo{ID: id, Addrs: []multiaddr.Multiaddr{gwMaddr}}),
 		engine.WithDirectAnnounce(*announceURL),
 		engine.WithPublisherKind(engine.HttpPublisher),
-		engine.WithHttpPublisherHandlerPath(ipniPath),
+		engine.WithHttpPublisherWithoutServer(),
+		// Empty handler path: ipniPath ("/ipni/") is a prefix of /ipni/v1/ad/,
+		// so the publisher's ServeHTTP is path-agnostic and keys only off
+		// path.Base. Passing "/ipni/" here makes it reject /ipni/v1/ad/head as
+		// an invalid path. We still mount the handler at ipniPath on our mux.
+		engine.WithHttpPublisherHandlerPath(""),
 		engine.WithHttpPublisherListenAddr(listenURL.Host),
 		engine.WithHttpPublisherAnnounceAddr(announceMaddr.String()),
 	)
@@ -164,6 +171,23 @@ func main() {
 			log.Printf("carpni: engine shutdown: %v", err)
 		}
 	}()
+
+	// Serve the ad chain. mux pattern "/ipni/" is a subtree match, so the
+	// indexer's GET /ipni/v1/ad/<cid> routes to the publisher handler, which
+	// keys off path.Base. Must be up before we announce.
+	handlerFunc, err := eng.GetPublisherHttpFunc()
+	if err != nil {
+		log.Fatalf("carpni: publisher handler: %v", err)
+	}
+	mux := http.NewServeMux()
+	mux.HandleFunc(ipniPath, handlerFunc)
+	adServer := &http.Server{Addr: listenURL.Host, Handler: mux}
+	go func() {
+		if err := adServer.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+			log.Fatalf("carpni: ad-chain server: %v", err)
+		}
+	}()
+	defer adServer.Close()
 
 	md := metadata.Default.New(metadata.IpfsGatewayHttp{})
 	adCid, err := eng.NotifyPut(ctx, nil, []byte(contextID), md)
