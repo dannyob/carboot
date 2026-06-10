@@ -1,5 +1,12 @@
 # carboot
 
+> **⚠️ Alpha — work in progress.** Not production-ready; expect rough edges and
+> breaking changes to flags and behaviour. Current state: `cargw` (the gateway)
+> is validated end-to-end against real CAR shards (serves raw blocks and
+> reconstructs full DAGs as CARs). `carpni` (the IPNI advertiser) builds and is
+> wired, but its live `cid.contact` ingestion has not yet been validated. No
+> releases, no stability promises. Use at your own risk.
+
 Serve a directory of CAR shards as an IPFS trustless gateway, and advertise
 their blocks to IPNI so kubo and the public gateways can retrieve them — without
 re-importing the data into an IPFS blockstore.
@@ -67,15 +74,23 @@ public URL):
 
 ```sh
 carpni --index /store/cars/_index/index.db \
-       --public-addr https://gw.example.org \
+       --public-addr http://gw.example.org:3747 \
+       --publisher-addr http://gw.example.org:3104 \
        --listen 0.0.0.0:3104 \
-       --announce-url https://cid.contact/ingest/announce \
+       --datastore ~/.carboot/adstore \
        --identity ~/.carboot/key
 ```
 
+`--public-addr` is the **gateway's** public URL (the content provider address
+that gets advertised). `--publisher-addr` is **this process's own** public URL,
+where the indexer pulls the advertisement chain from — it must be publicly
+reachable, and is distinct from the bind address in `--listen` (which may be
+`0.0.0.0`).
+
 `carpni` generates and persists an Ed25519 identity key on first run (default
-`~/.carboot/key`). Keep it stable across restarts, or cid.contact treats the
-provider as new and loses the ad-chain continuity.
+`~/.carboot/key`) and stores the advertisement chain in a leveldb datastore
+(default `~/.carboot/adstore`). Keep both stable across restarts, or cid.contact
+treats the provider as new and loses ad-chain continuity.
 
 ### Flags
 
@@ -92,9 +107,11 @@ carpni:
 | flag | default | meaning |
 | --- | --- | --- |
 | `--index` | (required) | path to the SQLite index |
-| `--public-addr` | (required) | gateway's public URL, advertised to IPNI |
-| `--listen` | `0.0.0.0:3104` | where the ad-chain handler is served |
+| `--public-addr` | (required) | gateway's public URL, advertised as the content provider |
+| `--publisher-addr` | (required) | this process's public URL, where the indexer fetches the ad chain |
+| `--listen` | `0.0.0.0:3104` | bind address for the ad-chain HTTP server |
 | `--announce-url` | `https://cid.contact/ingest/announce` | indexer announce endpoint |
+| `--datastore` | `~/.carboot/adstore` | persistent ad-chain datastore path |
 | `--identity` | `~/.carboot/key` | persisted Ed25519 key path |
 
 ## Scope
