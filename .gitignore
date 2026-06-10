@@ -1,0 +1,18 @@
+# Binaries
+/cargw
+/carpni
+/carboot
+*.exe
+*.test
+*.out
+
+# Build / coverage
+/dist/
+coverage.txt
+
+# Editor / OS
+.DS_Store
+*~
+
+# macOS markdown-previewer render artifacts
+**/.clearance-rendered-preview-*/
