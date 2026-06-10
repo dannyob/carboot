@@ -141,4 +141,4 @@ See `docs/specs/2026-06-10-carboot-design.md` for the full design.
 
 ## License
 
-AGPL-3.0-or-later. See [LICENSE](LICENSE).
+BSD-3-Clause. See [LICENSE](LICENSE).

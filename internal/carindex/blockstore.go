@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: AGPL-3.0-or-later
+// SPDX-License-Identifier: BSD-3-Clause
 
 // Package carindex provides a read-only boxo Blockstore backed by a SQLite
 // index (multihash -> shard,offset,length) and a directory of CAR shard files.

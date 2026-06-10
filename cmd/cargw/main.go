@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: AGPL-3.0-or-later
+// SPDX-License-Identifier: BSD-3-Clause
 
 // cargw serves a directory of CAR shards as an IPFS trustless gateway, backed
 // by a SQLite index. It is read-only and offline (no Bitswap, no network block

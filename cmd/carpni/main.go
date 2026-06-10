@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: AGPL-3.0-or-later
+// SPDX-License-Identifier: BSD-3-Clause
 
 // carpni advertises every block in the SQLite index to IPNI (cid.contact), so
 // that kubo and the public gateways discover that carboot's gateway can serve
