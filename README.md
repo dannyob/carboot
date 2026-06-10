@@ -1,6 +1,6 @@
 # carboot
 
-> **⚠️ Alpha — work in progress.** Not production-ready; expect rough edges and
+> **Alpha, work in progress.** Not production-ready; expect rough edges and
 > breaking changes to flags and behaviour. Current state: `cargw` (the gateway)
 > is validated end-to-end against real CAR shards (serves raw blocks and
 > reconstructs full DAGs as CARs). `carpni` (the IPNI advertiser) builds and is
@@ -8,7 +8,7 @@
 > releases, no stability promises. Use at your own risk.
 
 Serve a directory of CAR shards as an IPFS trustless gateway, and advertise
-their blocks to IPNI so kubo and the public gateways can retrieve them — without
+their blocks to IPNI so kubo and the public gateways can retrieve them, without
 re-importing the data into an IPFS blockstore.
 
 carboot was built to keep ~4.96 TB of Storacha export CARs (64k shards)
@@ -16,15 +16,28 @@ retrievable after Storacha shuts down. The shards stay on disk, read-only; a
 SQLite index maps each block's multihash to a `(shard, offset, length)`, and
 carboot reads block bytes straight out of the CAR files with positional reads.
 
-Two binaries, with the SQLite index as the only contract between them:
+Here it is serving a real shard: a single raw block, then the whole DAG
+reassembled into a CAR straight from the index, byte-for-byte the original:
 
-- **cargw** — a read-only [boxo](https://github.com/ipfs/boxo) trustless gateway.
-  Serves `GET /ipfs/{cid}?format=raw` and `?format=car&dag-scope=…` by looking
-  the CID's multihash up in the index and `ReadAt`-ing the bytes from the shard.
-- **carpni** — an [index-provider](https://github.com/ipni/index-provider)
-  advertiser. Streams every multihash from the index into a signed IPNI
-  advertisement chain announced to `cid.contact`, with the gateway's public URL
-  as the provider address over the `ipfs-gateway-http` transport.
+```console
+$ cargw --index index.db --cars-dir /store/cars --listen :3747 &
+$ curl -s 'localhost:3747/ipfs/bafybeiamqt...ipvlrmy?format=raw' | wc -c
+113
+$ curl -so out.car 'localhost:3747/ipfs/bafybeiamqt...ipvlrmy?format=car&dag-scope=all'
+$ wc -c < out.car      # the full UnixFS DAG; the shard on disk is 100035 bytes
+100035
+```
+
+Two binaries, with the SQLite index as the only contract between them.
+
+`cargw` is a read-only [boxo](https://github.com/ipfs/boxo) trustless gateway. It
+serves `GET /ipfs/{cid}?format=raw` and `?format=car&dag-scope=all` by looking the
+CID's multihash up in the index and `ReadAt`-ing the bytes from the shard.
+
+`carpni` is an [index-provider](https://github.com/ipni/index-provider)
+advertiser. It streams every multihash from the index into a signed IPNI
+advertisement chain announced to `cid.contact`, with the gateway's public URL as
+the provider address over the `ipfs-gateway-http` transport.
 
 The index itself is produced upstream by a separate Python tool (`car_index.py`)
 and is not part of carboot. Its merged schema:
@@ -81,11 +94,10 @@ carpni --index /store/cars/_index/index.db \
        --identity ~/.carboot/key
 ```
 
-`--public-addr` is the **gateway's** public URL (the content provider address
-that gets advertised). `--publisher-addr` is **this process's own** public URL,
-where the indexer pulls the advertisement chain from — it must be publicly
-reachable, and is distinct from the bind address in `--listen` (which may be
-`0.0.0.0`).
+`--public-addr` is the gateway's public URL (the content provider address that
+gets advertised). `--publisher-addr` is this process's own public URL, where the
+indexer pulls the advertisement chain from. It must be publicly reachable, and
+is distinct from the bind address in `--listen` (which may be `0.0.0.0`).
 
 `carpni` generates and persists an Ed25519 identity key on first run (default
 `~/.carboot/key`) and stores the advertisement chain in a leveldb datastore
@@ -118,8 +130,8 @@ carpni:
 
 carboot is not a trusted/full gateway: it does no UnixFS file reassembly for
 humans. Clients (ipfs.io via Lassie, kubo via HTTP block retrieval) reconstruct
-content from the raw blocks and CARs it serves. Blocks absent from the index —
-including the known-bad empty/truncated shards — simply 404.
+content from the raw blocks and CARs it serves. Blocks absent from the index
+(including the known-bad empty/truncated shards) simply 404.
 
 Each block fetch is one SQLite lookup plus one `ReadAt`, so a large DAG drives
 many random reads over the shard storage. Correct, not fast: the storage-speed
