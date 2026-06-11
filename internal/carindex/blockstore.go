@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: BSD-3-Clause
 
 // Package carindex provides a read-only boxo Blockstore backed by a SQLite
-// index (multihash -> shard,offset,length) and a directory of CAR shard files.
+// index (multihash -> car,offset,length) and a directory of CAR files.
 package carindex
 
 import (
@@ -24,33 +24,35 @@ import (
 	_ "modernc.org/sqlite" // registers the pure-Go "sqlite" driver
 )
 
-// defaultFDCacheSize is the number of open shard file descriptors kept hot.
+// defaultFDCacheSize is the number of open car file descriptors kept hot.
 const defaultFDCacheSize = 256
 
 // errReadOnly is returned by all mutating methods.
 var errReadOnly = errors.New("carindex: blockstore is read-only")
 
 // CarIndexBlockstore is a read-only blockstore.Blockstore backed by a SQLite
-// index and a directory of CAR shard files. Lookups are by raw multihash, so
-// the codec (raw 0x55 vs dag-pb 0x70) of the requested CID does not matter.
+// index and a directory of CAR files. Lookups are by raw multihash, so the
+// codec (raw 0x55 vs dag-pb 0x70) of the requested CID does not matter.
 type CarIndexBlockstore struct {
-	db       *sql.DB
-	stmt     *sql.Stmt
-	carsDir  string
-	shardMap map[int64]string // shard id -> filename (loaded once at Open)
+	db          *sql.DB
+	stmt        *sql.Stmt
+	dbPath      string
+	carsDirPath string
+
+	mapMu  sync.RWMutex
+	carMap map[int64]string // car id -> filename (loaded at Open, refreshed on miss)
 
 	fdCache *fdCache
 }
 
 var _ blockstore.Blockstore = (*CarIndexBlockstore)(nil) // compile-time interface check
 
-// Open opens the SQLite index at dbPath (read-only) and prepares the blockstore
-// to read shard files from carsDir.
+// Open opens the SQLite index at dbPath (read-only, WAL-aware) and prepares the
+// blockstore to read CAR files from carsDir.
 func Open(dbPath, carsDir string) (*CarIndexBlockstore, error) {
-	// immutable=1 reads the main db file directly, ignores WAL/locking; correct
-	// for a static upstream-produced index that may sit on a read-only mount.
-	dsn := "file:" + dbPath + "?immutable=1&_pragma=busy_timeout(5000)"
-	db, err := sql.Open("sqlite", dsn)
+	// OpenRO opens mode=ro (NOT immutable=1), so a live reindexer's committed
+	// writes become visible to the running gateway.
+	db, err := OpenRO(dbPath)
 	if err != nil {
 		return nil, fmt.Errorf("carindex: open db: %w", err)
 	}
@@ -62,24 +64,25 @@ func Open(dbPath, carsDir string) (*CarIndexBlockstore, error) {
 		return nil, fmt.Errorf("carindex: ping db: %w", err)
 	}
 
-	shardMap, err := loadShardMap(db)
+	carMap, err := loadCarMap(db)
 	if err != nil {
 		db.Close()
 		return nil, err
 	}
 
-	stmt, err := db.Prepare(`SELECT shard, off, len FROM blk WHERE mh = ?`)
+	stmt, err := db.Prepare(`SELECT car, off, len FROM blk WHERE mh = ?`)
 	if err != nil {
 		db.Close()
 		return nil, fmt.Errorf("carindex: prepare lookup: %w", err)
 	}
 
 	return &CarIndexBlockstore{
-		db:       db,
-		stmt:     stmt,
-		carsDir:  carsDir,
-		shardMap: shardMap,
-		fdCache:  newFDCache(defaultFDCacheSize),
+		db:          db,
+		stmt:        stmt,
+		dbPath:      dbPath,
+		carsDirPath: carsDir,
+		carMap:      carMap,
+		fdCache:     newFDCache(defaultFDCacheSize),
 	}, nil
 }
 
@@ -87,29 +90,35 @@ func Open(dbPath, carsDir string) (*CarIndexBlockstore, error) {
 // It shares the same read-only connection pool.
 func (cb *CarIndexBlockstore) DB() *sql.DB { return cb.db }
 
-func loadShardMap(db *sql.DB) (map[int64]string, error) {
-	rows, err := db.Query(`SELECT id, name FROM shards`)
+// indexPath returns the on-disk path of the SQLite index.
+func (cb *CarIndexBlockstore) indexPath() string { return cb.dbPath }
+
+// carsDir returns the directory of CAR files this blockstore reads from.
+func (cb *CarIndexBlockstore) carsDir() string { return cb.carsDirPath }
+
+func loadCarMap(db *sql.DB) (map[int64]string, error) {
+	rows, err := db.Query(`SELECT id, path FROM cars`)
 	if err != nil {
-		return nil, fmt.Errorf("carindex: query shards: %w", err)
+		return nil, fmt.Errorf("carindex: query cars: %w", err)
 	}
 	defer rows.Close()
 
 	m := make(map[int64]string)
 	for rows.Next() {
 		var id int64
-		var name string
-		if err := rows.Scan(&id, &name); err != nil {
-			return nil, fmt.Errorf("carindex: scan shard: %w", err)
+		var path string
+		if err := rows.Scan(&id, &path); err != nil {
+			return nil, fmt.Errorf("carindex: scan car: %w", err)
 		}
-		m[id] = name
+		m[id] = path
 	}
 	if err := rows.Err(); err != nil {
-		return nil, fmt.Errorf("carindex: iterate shards: %w", err)
+		return nil, fmt.Errorf("carindex: iterate cars: %w", err)
 	}
 	return m, nil
 }
 
-// Close releases the prepared statement, open shard fds, and the db handle.
+// Close releases the prepared statement, open car fds, and the db handle.
 func (cb *CarIndexBlockstore) Close() error {
 	var errs []error
 	if cb.fdCache != nil {
@@ -138,28 +147,50 @@ func identityData(c cid.Cid) ([]byte, bool) {
 	return dmh.Digest, true
 }
 
-// lookup resolves a multihash to (shard id, offset, length).
-func (cb *CarIndexBlockstore) lookup(ctx context.Context, c cid.Cid) (shard, off, length int64, err error) {
+// lookup resolves a multihash to (car id, offset, length).
+func (cb *CarIndexBlockstore) lookup(ctx context.Context, c cid.Cid) (car, off, length int64, err error) {
 	mh := []byte(c.Hash()) // BLOB binding; never bind as string (binds as TEXT, silently misses)
-	err = cb.stmt.QueryRowContext(ctx, mh).Scan(&shard, &off, &length)
+	err = cb.stmt.QueryRowContext(ctx, mh).Scan(&car, &off, &length)
 	return
 }
 
-// shardPath resolves a shard id to its on-disk path.
-func (cb *CarIndexBlockstore) shardPath(shard int64) (string, error) {
-	name, ok := cb.shardMap[shard]
+// carPath resolves a car id to its on-disk path, reloading the map once on a
+// miss so a live reindexer's newly-added cars are picked up without a restart.
+func (cb *CarIndexBlockstore) carPath(car int64) (string, error) {
+	cb.mapMu.RLock()
+	name, ok := cb.carMap[car]
+	cb.mapMu.RUnlock()
 	if !ok {
-		return "", fmt.Errorf("carindex: unknown shard id %d", shard)
+		if err := cb.reloadCarMap(); err != nil {
+			return "", err
+		}
+		cb.mapMu.RLock()
+		name, ok = cb.carMap[car]
+		cb.mapMu.RUnlock()
 	}
-	return filepath.Join(cb.carsDir, name), nil
+	if !ok {
+		return "", fmt.Errorf("carindex: unknown car id %d", car)
+	}
+	return filepath.Join(cb.carsDirPath, name), nil
 }
 
-// Get returns the block for c, reading its data bytes from the shard file.
+func (cb *CarIndexBlockstore) reloadCarMap() error {
+	m, err := loadCarMap(cb.db) // SELECT id,path FROM cars
+	if err != nil {
+		return err
+	}
+	cb.mapMu.Lock()
+	cb.carMap = m
+	cb.mapMu.Unlock()
+	return nil
+}
+
+// Get returns the block for c, reading its data bytes from the car file.
 func (cb *CarIndexBlockstore) Get(ctx context.Context, c cid.Cid) (blocks.Block, error) {
 	if data, ok := identityData(c); ok {
 		return blocks.NewBlockWithCid(data, c)
 	}
-	shard, off, length, err := cb.lookup(ctx, c)
+	car, off, length, err := cb.lookup(ctx, c)
 	if err == sql.ErrNoRows {
 		return nil, ipld.ErrNotFound{Cid: c}
 	}
@@ -167,14 +198,14 @@ func (cb *CarIndexBlockstore) Get(ctx context.Context, c cid.Cid) (blocks.Block,
 		return nil, fmt.Errorf("carindex: index lookup for %s: %w", c, err)
 	}
 
-	path, err := cb.shardPath(shard)
+	path, err := cb.carPath(car)
 	if err != nil {
 		return nil, err
 	}
 
 	f, err := cb.fdCache.get(path)
 	if err != nil {
-		return nil, fmt.Errorf("carindex: open shard %s: %w", path, err)
+		return nil, fmt.Errorf("carindex: open car %s: %w", path, err)
 	}
 
 	buf := make([]byte, length)
@@ -257,7 +288,7 @@ func (cb *CarIndexBlockstore) Put(context.Context, blocks.Block) error { return 
 // PutMany is read-only.
 func (cb *CarIndexBlockstore) PutMany(context.Context, []blocks.Block) error { return errReadOnly }
 
-// fdCache is a bounded LRU of open shard files keyed by path. ReadAt is safe
+// fdCache is a bounded LRU of open car files keyed by path. ReadAt is safe
 // for concurrent use, so file handles are shared across goroutines.
 type fdCache struct {
 	mu    sync.Mutex

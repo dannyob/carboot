@@ -85,9 +85,9 @@ func writeUvarint(buf *bytes.Buffer, v uint64) {
 	buf.Write(tmp[:n])
 }
 
-// buildIndex creates a SQLite index (blk + shards) pointing at the shard file's
+// buildIndex creates a SQLite index (blk + cars) pointing at the car file's
 // block locations.
-func buildIndex(t *testing.T, dbPath, shardName string, recs []blockRec) {
+func buildIndex(t *testing.T, dbPath, carName string, recs []blockRec) {
 	t.Helper()
 
 	db, err := sql.Open("sqlite", "file:"+dbPath+"?_pragma=busy_timeout(5000)")
@@ -97,18 +97,18 @@ func buildIndex(t *testing.T, dbPath, shardName string, recs []blockRec) {
 	defer db.Close()
 
 	schema := `
-CREATE TABLE blk(mh BLOB PRIMARY KEY, shard INTEGER, off INTEGER, len INTEGER);
-CREATE TABLE shards(id INTEGER PRIMARY KEY, name TEXT);
+CREATE TABLE blk(mh BLOB PRIMARY KEY, car INTEGER, off INTEGER, len INTEGER);
+CREATE TABLE cars(id INTEGER PRIMARY KEY, path TEXT UNIQUE, mtime INTEGER, size INTEGER, status TEXT, detail TEXT);
 `
 	if _, err := db.Exec(schema); err != nil {
 		t.Fatalf("create schema: %v", err)
 	}
-	if _, err := db.Exec(`INSERT INTO shards(id, name) VALUES (1, ?)`, shardName); err != nil {
-		t.Fatalf("insert shard: %v", err)
+	if _, err := db.Exec(`INSERT INTO cars(id, path) VALUES (1, ?)`, carName); err != nil {
+		t.Fatalf("insert car: %v", err)
 	}
 	for _, r := range recs {
 		mh := []byte(r.cid.Hash())
-		if _, err := db.Exec(`INSERT INTO blk(mh, shard, off, len) VALUES (?, 1, ?, ?)`, mh, r.off, r.len); err != nil {
+		if _, err := db.Exec(`INSERT INTO blk(mh, car, off, len) VALUES (?, 1, ?, ?)`, mh, r.off, r.len); err != nil {
 			t.Fatalf("insert blk: %v", err)
 		}
 	}
@@ -120,8 +120,8 @@ func setup(t *testing.T) (*CarIndexBlockstore, []blockRec) {
 	t.Helper()
 
 	dir := t.TempDir()
-	shardName := "test.shard-0.car"
-	shardPath := filepath.Join(dir, shardName)
+	carName := "test.car-0.car"
+	carPath := filepath.Join(dir, carName)
 	dbPath := filepath.Join(dir, "index.db")
 
 	datas := [][]byte{
@@ -130,8 +130,8 @@ func setup(t *testing.T) (*CarIndexBlockstore, []blockRec) {
 		[]byte("third"),
 		bytes.Repeat([]byte{0xAB}, 1024),
 	}
-	recs := writeCARv1(t, shardPath, datas)
-	buildIndex(t, dbPath, shardName, recs)
+	recs := writeCARv1(t, carPath, datas)
+	buildIndex(t, dbPath, carName, recs)
 
 	bs, err := Open(dbPath, dir)
 	if err != nil {
@@ -358,5 +358,35 @@ func TestGatewayServesCAR(t *testing.T) {
 	// raw data must appear somewhere in the CAR body.
 	if !bytes.Contains(body.Bytes(), r.data) {
 		t.Errorf("car body does not contain block data")
+	}
+}
+
+// TestLazyCarMapRefresh simulates a live reindex: a writer adds a new car +
+// block to the same DB while the gateway is already open. The gateway must
+// serve the new block by lazily reloading its car-id->path map on a miss.
+func TestLazyCarMapRefresh(t *testing.T) {
+	bs, _ := setup(t) // opens the blockstore over an existing index
+	ctx := context.Background()
+
+	// simulate a live reindex: a writer adds a new car + block to the SAME db.
+	db, err := OpenRW(bs.indexPath()) // add an accessor returning the db path
+	if err != nil {
+		t.Fatal(err)
+	}
+	// write a new car file + matching index row; reuse writeCARv1/buildIndex helpers
+	dir := bs.carsDir() // add accessor
+	recs := writeCARv1(t, filepath.Join(dir, "new.car"), [][]byte{[]byte("freshly added block")})
+	db.Exec(`INSERT INTO cars(path) VALUES('new.car')`)
+	var carID int64
+	db.QueryRow(`SELECT id FROM cars WHERE path='new.car'`).Scan(&carID)
+	db.Exec(`INSERT INTO blk(mh,car,off,len) VALUES(?,?,?,?)`, []byte(recs[0].cid.Hash()), carID, recs[0].off, recs[0].len)
+	db.Close()
+	// gateway (opened before the write) must serve the new block via lazy refresh
+	blk, err := bs.Get(ctx, recs[0].cid)
+	if err != nil {
+		t.Fatalf("Get after live reindex: %v", err)
+	}
+	if !bytes.Equal(blk.RawData(), recs[0].data) {
+		t.Error("data mismatch after refresh")
 	}
 }
