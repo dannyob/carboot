@@ -17,6 +17,7 @@ import (
 	blocks "github.com/ipfs/go-block-format"
 	"github.com/ipfs/go-cid"
 	ipld "github.com/ipfs/go-ipld-format"
+	"github.com/multiformats/go-multihash"
 
 	"github.com/ipfs/boxo/blockstore"
 
@@ -123,6 +124,20 @@ func (cb *CarIndexBlockstore) Close() error {
 	return errors.Join(errs...)
 }
 
+// identityData returns (data, true) when c uses the identity multihash, whose
+// digest IS the block data, so it is served inline without an index lookup.
+// This matters beyond correctness: httpnet's connect probe (used by kubo HTTP
+// retrieval, ipfs.io, and check.ipfs.network) requests the empty identity CID
+// bafkqaaa and requires a 2xx, so a gateway that 404s identity CIDs is rejected
+// by every httpnet client before any real retrieval.
+func identityData(c cid.Cid) ([]byte, bool) {
+	dmh, err := multihash.Decode(c.Hash())
+	if err != nil || dmh.Code != multihash.IDENTITY {
+		return nil, false
+	}
+	return dmh.Digest, true
+}
+
 // lookup resolves a multihash to (shard id, offset, length).
 func (cb *CarIndexBlockstore) lookup(ctx context.Context, c cid.Cid) (shard, off, length int64, err error) {
 	mh := []byte(c.Hash()) // BLOB binding; never bind as string (binds as TEXT, silently misses)
@@ -141,6 +156,9 @@ func (cb *CarIndexBlockstore) shardPath(shard int64) (string, error) {
 
 // Get returns the block for c, reading its data bytes from the shard file.
 func (cb *CarIndexBlockstore) Get(ctx context.Context, c cid.Cid) (blocks.Block, error) {
+	if data, ok := identityData(c); ok {
+		return blocks.NewBlockWithCid(data, c)
+	}
 	shard, off, length, err := cb.lookup(ctx, c)
 	if err == sql.ErrNoRows {
 		return nil, ipld.ErrNotFound{Cid: c}
@@ -174,6 +192,9 @@ func (cb *CarIndexBlockstore) Get(ctx context.Context, c cid.Cid) (blocks.Block,
 
 // Has reports whether the multihash of c is in the index.
 func (cb *CarIndexBlockstore) Has(ctx context.Context, c cid.Cid) (bool, error) {
+	if _, ok := identityData(c); ok {
+		return true, nil
+	}
 	_, _, _, err := cb.lookup(ctx, c)
 	if err == sql.ErrNoRows {
 		return false, nil
@@ -186,6 +207,9 @@ func (cb *CarIndexBlockstore) Has(ctx context.Context, c cid.Cid) (bool, error) 
 
 // GetSize returns the stored data length for c.
 func (cb *CarIndexBlockstore) GetSize(ctx context.Context, c cid.Cid) (int, error) {
+	if data, ok := identityData(c); ok {
+		return len(data), nil
+	}
 	_, _, length, err := cb.lookup(ctx, c)
 	if err == sql.ErrNoRows {
 		return 0, ipld.ErrNotFound{Cid: c}

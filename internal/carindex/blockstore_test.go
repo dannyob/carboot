@@ -168,6 +168,45 @@ func TestGetRoundTrip(t *testing.T) {
 	}
 }
 
+func TestIdentityCID(t *testing.T) {
+	bs, _ := setup(t)
+	ctx := context.Background()
+
+	// bafkqaaa is the empty identity CID httpnet uses as its connect probe; the
+	// gateway must serve it inline (200), not 404 it, or every httpnet client
+	// (kubo HTTP retrieval, ipfs.io, check.ipfs.network) rejects the endpoint.
+	emptyMH, _ := multihash.Sum([]byte{}, multihash.IDENTITY, -1)
+	emptyCid := cid.NewCidV1(cid.Raw, emptyMH)
+	if emptyCid.String() != "bafkqaaa" {
+		t.Fatalf("expected bafkqaaa, got %s", emptyCid.String())
+	}
+	blk, err := bs.Get(ctx, emptyCid)
+	if err != nil {
+		t.Fatalf("Get(bafkqaaa): %v", err)
+	}
+	if len(blk.RawData()) != 0 {
+		t.Errorf("bafkqaaa: want 0 bytes, got %d", len(blk.RawData()))
+	}
+	if has, err := bs.Has(ctx, emptyCid); err != nil || !has {
+		t.Errorf("Has(bafkqaaa) = %v, %v; want true, nil", has, err)
+	}
+	if sz, err := bs.GetSize(ctx, emptyCid); err != nil || sz != 0 {
+		t.Errorf("GetSize(bafkqaaa) = %d, %v; want 0, nil", sz, err)
+	}
+
+	// A non-empty identity CID returns its inline digest as the data.
+	data := []byte("inline identity data")
+	idMH, _ := multihash.Sum(data, multihash.IDENTITY, -1)
+	idCid := cid.NewCidV1(cid.Raw, idMH)
+	blk, err = bs.Get(ctx, idCid)
+	if err != nil {
+		t.Fatalf("Get(identity): %v", err)
+	}
+	if !bytes.Equal(blk.RawData(), data) {
+		t.Errorf("identity data mismatch: got %q want %q", blk.RawData(), data)
+	}
+}
+
 func TestHasAndGetSize(t *testing.T) {
 	bs, recs := setup(t)
 	ctx := context.Background()
