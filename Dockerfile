@@ -12,10 +12,14 @@ ARG TARGETOS=linux
 ARG TARGETARCH
 RUN CGO_ENABLED=0 GOOS=$TARGETOS GOARCH=$TARGETARCH go build -ldflags='-s -w' -o /out/carboot ./cmd/carboot
 
-# distroless/static carries CA certs (advertise dials cid.contact over HTTPS) and
-# runs as nonroot. The binary lands in /usr/local/bin; the default command is the
-# gateway, with reindex and advertise available as subcommands.
-FROM gcr.io/distroless/static-debian12:nonroot
+# distroless/static carries CA certs (advertise dials cid.contact over HTTPS).
+# This is the root (uid 0) variant on purpose, not :nonroot: reindex must WRITE
+# the index, and a read-only gateway over a WAL index still creates the -shm
+# sidecar. Under rootless podman, container uid 0 maps to the invoking host user,
+# so a host-owned index/cars volume is writable with no --user flag or chown. The
+# binary lands in /usr/local/bin; the default command is the gateway, with
+# reindex and advertise available as subcommands.
+FROM gcr.io/distroless/static-debian12
 COPY --from=build /out/carboot /usr/local/bin/
 ENTRYPOINT ["/usr/local/bin/carboot"]
 CMD ["gateway"]
