@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: BSD-3-Clause
 
-package main
+package advertise
 
 import (
 	"context"
@@ -27,7 +27,7 @@ func TestSQLiteMHIterator(t *testing.T) {
 		t.Fatalf("open: %v", err)
 	}
 	defer db.Close()
-	if _, err := db.Exec(`CREATE TABLE blk(mh BLOB PRIMARY KEY, shard INTEGER, off INTEGER, len INTEGER)`); err != nil {
+	if _, err := db.Exec(`CREATE TABLE blk(mh BLOB PRIMARY KEY, car INTEGER, off INTEGER, len INTEGER)`); err != nil {
 		t.Fatalf("schema: %v", err)
 	}
 
@@ -39,7 +39,7 @@ func TestSQLiteMHIterator(t *testing.T) {
 		if err != nil {
 			t.Fatalf("encode: %v", err)
 		}
-		if _, err := db.Exec(`INSERT INTO blk(mh,shard,off,len) VALUES(?,?,?,?)`, []byte(mh), 0, int64(i), 1); err != nil {
+		if _, err := db.Exec(`INSERT INTO blk(mh,car,off,len) VALUES(?,?,?,?)`, []byte(mh), 0, int64(i), 1); err != nil {
 			t.Fatalf("insert: %v", err)
 		}
 		want = append(want, mh)
