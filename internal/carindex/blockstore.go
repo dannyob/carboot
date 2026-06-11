@@ -218,6 +218,11 @@ func (cb *CarIndexBlockstore) Get(ctx context.Context, c cid.Cid) (blocks.Block,
 	if err != nil {
 		return nil, fmt.Errorf("carindex: block hash mismatch for %s: %w", c, err)
 	}
+
+	if col := collectorFrom(ctx); col != nil {
+		rel, _ := filepath.Rel(cb.carsDirPath, path) // path is the car file path
+		col.record(rel, length)
+	}
 	return blk, nil
 }
 
