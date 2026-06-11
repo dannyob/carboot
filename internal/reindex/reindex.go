@@ -25,6 +25,12 @@ func Run(dbPath, carsDir string) error {
 	if err != nil {
 		return err
 	}
+	// A just-migrated legacy index has NULL mtime/size on every car. Populate
+	// them from the on-disk stat and trust the existing blocks, so the change
+	// detection below skips them instead of re-reading every CAR (4.96TB).
+	if err := backfillLegacyMtimes(db, onDisk); err != nil {
+		return err
+	}
 	inDB, err := loadCars(db) // relpath -> (id,mtime,size)
 	if err != nil {
 		return err
@@ -75,6 +81,45 @@ func scanDir(root string) (map[string]finfo, error) {
 		return nil
 	})
 	return out, err
+}
+
+// backfillLegacyMtimes populates mtime/size for migrated legacy car rows (whose
+// columns are NULL) from the current on-disk stat, WITHOUT re-reading block
+// data. This lets a reindex over a just-migrated index skip the existing,
+// still-valid blocks. Rows whose file is absent on disk are left NULL; the prune
+// pass in Run drops them.
+func backfillLegacyMtimes(db *sql.DB, onDisk map[string]finfo) error {
+	rows, err := db.Query(`SELECT id, path FROM cars WHERE mtime IS NULL`)
+	if err != nil {
+		return err
+	}
+	type leg struct {
+		id   int64
+		path string
+	}
+	var legacy []leg
+	for rows.Next() {
+		var l leg
+		if err := rows.Scan(&l.id, &l.path); err != nil {
+			rows.Close()
+			return err
+		}
+		legacy = append(legacy, l)
+	}
+	rows.Close()
+	if err := rows.Err(); err != nil {
+		return err
+	}
+	for _, l := range legacy {
+		fi, ok := onDisk[l.path]
+		if !ok {
+			continue
+		}
+		if _, err := db.Exec(`UPDATE cars SET mtime=?, size=? WHERE id=?`, fi.mtime, fi.size, l.id); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 func loadCars(db *sql.DB) (map[string]carrow, error) {

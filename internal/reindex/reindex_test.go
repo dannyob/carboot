@@ -149,3 +149,84 @@ func TestReindexRecursiveSync(t *testing.T) {
 		t.Errorf("b.car blk rows not pruned (n=%d)", got)
 	}
 }
+
+// TestReindexLegacyBackfillNoReindex proves that running Run over a freshly
+// migrated legacy index populates cars.mtime/size from disk stat and TRUSTS the
+// existing blk rows instead of re-reading every CAR. The legacy index is seeded
+// with a sentinel blk row that does NOT correspond to a.car's real blocks; if
+// Run re-indexed the file, that sentinel would be deleted and replaced.
+func TestReindexLegacyBackfillNoReindex(t *testing.T) {
+	dir := t.TempDir()
+	carsDir := filepath.Join(dir, "cars")
+	if err := os.MkdirAll(carsDir, 0755); err != nil {
+		t.Fatal(err)
+	}
+	aPath := filepath.Join(carsDir, "a.car")
+	writeTestCAR(t, aPath, [][]byte{[]byte("real block one"), []byte("real block two")})
+
+	dbPath := filepath.Join(dir, "index.db")
+	// Build a legacy {shards, blk.shard} index by hand, with a sentinel blk row.
+	raw, err := sql.Open("sqlite", "file:"+dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Mirror the real legacy schema the Python builder produced.
+	raw.Exec(`CREATE TABLE shards(id INTEGER PRIMARY KEY, name TEXT, nblocks INTEGER, status TEXT, detail TEXT)`)
+	raw.Exec(`CREATE TABLE blk(mh BLOB PRIMARY KEY, shard INTEGER, off INTEGER, len INTEGER)`)
+	raw.Exec(`INSERT INTO shards(id,name,nblocks,status) VALUES(1,'a.car',2,'done')`)
+	sentinel := append([]byte{0x12, 0x20}, bytes.Repeat([]byte{0xAB}, 32)...)
+	if _, err := raw.Exec(`INSERT INTO blk(mh,shard,off,len) VALUES(?,1,999999,42)`, sentinel); err != nil {
+		t.Fatal(err)
+	}
+	raw.Close()
+
+	if err := Run(dbPath, carsDir); err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+
+	db, err := sql.Open("sqlite", "file:"+dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+
+	// mtime/size populated from disk stat (no longer NULL).
+	fi, _ := os.Stat(aPath)
+	var mtime, size sql.NullInt64
+	if err := db.QueryRow(`SELECT mtime,size FROM cars WHERE path='a.car'`).Scan(&mtime, &size); err != nil {
+		t.Fatal(err)
+	}
+	if !mtime.Valid || mtime.Int64 != fi.ModTime().Unix() {
+		t.Errorf("mtime not backfilled: %+v want %d", mtime, fi.ModTime().Unix())
+	}
+	if !size.Valid || size.Int64 != fi.Size() {
+		t.Errorf("size not backfilled: %+v want %d", size, fi.Size())
+	}
+
+	// Sentinel survives => a.car was NOT re-indexed.
+	idA := carID(t, db, "a.car")
+	var off int64
+	var n int
+	db.QueryRow(`SELECT count(*) FROM blk WHERE car=?`, idA).Scan(&n)
+	if n != 1 {
+		t.Fatalf("a.car blk rows = %d, want 1 (sentinel preserved, no re-index)", n)
+	}
+	db.QueryRow(`SELECT off FROM blk WHERE car=?`, idA).Scan(&off)
+	if off != 999999 {
+		t.Errorf("sentinel blk off = %d, want 999999 (file was re-indexed!)", off)
+	}
+
+	// A genuinely new car is still indexed on a later run; a.car stays untouched.
+	bPath := filepath.Join(carsDir, "b.car")
+	writeTestCAR(t, bPath, [][]byte{[]byte("brand new block")})
+	if err := Run(dbPath, carsDir); err != nil {
+		t.Fatalf("Run 2: %v", err)
+	}
+	if got := blkCount(t, db, carID(t, db, "b.car")); got == 0 {
+		t.Error("b.car was not indexed on second run")
+	}
+	db.QueryRow(`SELECT off FROM blk WHERE car=?`, idA).Scan(&off)
+	if off != 999999 {
+		t.Errorf("after run 2, a.car sentinel off = %d, want 999999", off)
+	}
+}

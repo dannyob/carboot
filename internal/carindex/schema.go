@@ -43,7 +43,8 @@ func OpenRO(path string) (*sql.DB, error) {
 }
 
 // migrate upgrades a legacy {shards, blk.shard} index to {cars, blk.car} in
-// place: rename table/column, add mtime/size. No block-data is touched.
+// place: rename table/column, add mtime/size, add the cars.path unique index.
+// No block-data is touched; reindex.Run does the mtime/size stat backfill.
 func migrate(db *sql.DB) error {
 	var hasShards int
 	db.QueryRow(`SELECT count(*) FROM sqlite_master WHERE type='table' AND name='shards'`).Scan(&hasShards)
@@ -61,6 +62,10 @@ func migrate(db *sql.DB) error {
 		`ALTER TABLE blk RENAME COLUMN shard TO car`,
 		`ALTER TABLE cars ADD COLUMN mtime INTEGER`,
 		`ALTER TABLE cars ADD COLUMN size INTEGER`,
+		// The legacy table had no UNIQUE on name; a renamed column keeps that.
+		// indexOne's ON CONFLICT(path) upsert needs one, so add it explicitly.
+		// (A fresh DB gets it from createSchema's `path TEXT UNIQUE`.)
+		`CREATE UNIQUE INDEX IF NOT EXISTS cars_path_idx ON cars(path)`,
 	}
 	for _, s := range stmts {
 		if _, err := db.Exec(s); err != nil {
