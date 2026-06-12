@@ -153,10 +153,11 @@ Mount the CAR directory read-only and the index on a writable volume so it
 persists and `reindex` can write it.
 
 The image runs as root (uid 0). Under rootless podman that maps to the host user
-who started podman, so a host-owned index volume is writable as-is — no `--user`
-flag or `chown`. Under Docker, or if the index is owned by some other uid, pass
-`--user <owner-uid>:<owner-gid>` so the container can write the index (the
-gateway needs it too: a read-only WAL reader still creates the `-shm` sidecar).
+who started podman, so a host-owned index volume is writable as-is, with no
+`--user` flag or `chown`. Under Docker, or if the index is owned by some other
+uid, pass `--user <owner-uid>:<owner-gid>` so the container can write the index.
+The gateway needs write access too: a read-only WAL reader still creates the
+`-shm` sidecar.
 
 To update the index of a running gateway without restarting it, run `reindex`
 as a second process in the same container:
