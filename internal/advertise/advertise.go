@@ -227,6 +227,19 @@ func Run(ctx context.Context, opt Options) error {
 // publicAddrToMaddr converts a public URL (or multiaddr) into a multiaddr.
 func publicAddrToMaddr(addr string) (multiaddr.Multiaddr, error) {
 	if u, err := url.Parse(addr); err == nil && u.Scheme != "" {
+		// maurl.FromURL drops the /tcp/<port> component when the URL has no
+		// explicit port (https://host -> /dns/host/https). Clients built before
+		// boxo#1123 (legacy kubo) can't infer the port from /https and silently
+		// reject the provider. Pin the scheme's default port so the advertised
+		// multiaddr carries /tcp/<port>, which works on both old and new clients.
+		if u.Port() == "" {
+			switch u.Scheme {
+			case "https":
+				u.Host = u.Hostname() + ":443"
+			case "http":
+				u.Host = u.Hostname() + ":80"
+			}
+		}
 		return maurl.FromURL(u)
 	}
 	return multiaddr.NewMultiaddr(addr)

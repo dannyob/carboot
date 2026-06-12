@@ -9,6 +9,7 @@ import (
 	"errors"
 	"io"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/multiformats/go-multihash"
@@ -87,5 +88,33 @@ func TestSQLiteMHIterator(t *testing.T) {
 	}
 	if n != len(want) {
 		t.Errorf("second pass yielded %d, want %d", n, len(want))
+	}
+}
+
+// TestPublicAddrToMaddrForcesPort checks that a scheme URL with no explicit port
+// produces a multiaddr carrying an explicit /tcp/<default-port> component. A
+// portless HTTP multiaddr like /dns/host/https is silently rejected by clients
+// built before boxo#1123 (legacy kubo), so the advertised provider address must
+// pin the port.
+func TestPublicAddrToMaddrForcesPort(t *testing.T) {
+	cases := []struct {
+		in   string
+		want []string // substrings the multiaddr string must contain
+	}{
+		{"https://gw.fastfils.org", []string{"/dns/gw.fastfils.org", "/tcp/443", "/https"}},
+		{"http://example.org", []string{"/dns/example.org", "/tcp/80", "/http"}},
+		{"https://host.example:8443", []string{"/tcp/8443", "/https"}}, // explicit port preserved
+	}
+	for _, c := range cases {
+		m, err := publicAddrToMaddr(c.in)
+		if err != nil {
+			t.Fatalf("publicAddrToMaddr(%q): %v", c.in, err)
+		}
+		got := m.String()
+		for _, sub := range c.want {
+			if !strings.Contains(got, sub) {
+				t.Errorf("publicAddrToMaddr(%q) = %q, want substring %q", c.in, got, sub)
+			}
+		}
 	}
 }
